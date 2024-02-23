@@ -1,0 +1,20 @@
+environments:
+  default:
+    missingFileHandler: Info
+
+helmDefaults:
+  cleanupOnFail: true
+  wait: true
+  timeout: 900
+
+templates:
+  default: &default
+    missingFileHandler: Debug
+    values:
+      - "defaults/{{`{{ .Release.Name }}`}}/values.yaml.gotmpl"
+
+releases:
+  - name: fortio
+    <<: *default
+    namespace: fortio
+    chart: ./helm/fortio
