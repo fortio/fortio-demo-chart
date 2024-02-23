@@ -1,0 +1,21 @@
+FortioProtocol: http2
+FortiotelVersion: 1.63.3
+resources:
+  requests:
+    cpu: 200m
+    memory: 200Mi
+  limits:
+    cpu: 1.1
+    memory: 300Mi
+commonSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+Labels:
+  {{.Release.Labels | toYaml | nindent 2}}
+TracingZipkin: false # When true, use zipkin multi, when false enables W3C (traceparent:) tracing headers

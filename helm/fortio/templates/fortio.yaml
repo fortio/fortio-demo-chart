@@ -1,0 +1,416 @@
+# Implements https://github.com/fortio/fortio-demo-chart#fortio-demo-chart
+# Note that out of the box fortio fulfills 'baseline' Pod Security Admission
+# https://kubernetes.io/docs/concepts/security/pod-security-standards/
+# And for the 'restricted' level, we need to add the commonSecurityContext found in
+# defaults/fortio/values.yaml.gotmpl
+#
+# Service "A" definition
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-client
+  namespace: fortio
+  labels:
+    {{- .Values.Labels | toYaml | nindent 4}}
+spec:
+  ports:
+  - port: 8078
+    name: tcp-echo
+  - port: 8079
+    name: grpc-ping
+  - port: 8080
+    name: {{ .Values.FortioProtocol }}-fortio
+  - port: 8081
+    name: http-redir
+  selector:
+    app: fortio-client
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortio-client-deployment
+  namespace: fortio
+  labels:
+    {{- .Values.Labels | toYaml | nindent 4}}
+spec:
+  replicas: 1 # tells deployment to run 1 pod(s) matching the template
+  selector:
+    matchLabels:
+      app: fortio-client
+  template: # create pods using pod definition in this template
+    metadata:
+      annotations:
+        prometheus.io/path: /fortio/debug/metrics
+        prometheus.io/port: "8080"
+      # a unique name is generated from the deployment name
+      labels:
+        app: fortio-client
+    spec:
+      priorityClassName: system
+      containers:
+      - name: fortio-client
+        image: fortio/fortiotel:{{ .Values.FortiotelVersion }}
+        imagePullPolicy: Always # IfNotPresent when using explicit version tag (not "latest") [but we do use latest/latest_release in some cases]
+        securityContext: {{- toYaml .Values.commonSecurityContext | nindent 10 }}
+        ports:
+        - containerPort: 8078 # tcp echo
+        - containerPort: 8079 # grpc echo
+        - containerPort: 8080 # main serving port
+        - containerPort: 8081 # redirection to https port
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        args:
+          - server
+          - -config-dir
+          - /etc/fortio/
+          - -echo-debug-path
+          - /fortio/debug/
+#          - -sync
+#          - https://storage.googleapis.com:443/fortio-data?prefix=fortio.istio.io/
+#          - -sync-interval
+#          - 15m # sync every 15 minutes
+        volumeMounts:
+          - mountPath: /var/lib/fortio
+            name: fortio-data
+          - mountPath: /etc/fortio
+            name: fortio-config
+      volumes:
+        - name: fortio-data
+          emptyDir:
+            medium: Memory
+        - name: fortio-config
+          configMap:
+            name: fortio-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fortio-config
+  namespace: fortio
+  annotations:
+    flagger.app/config-tracking: disabled
+  labels:
+    {{- .Values.Labels | toYaml | nindent 4}}
+data:
+  #loglevel: verbose
+  # Use w3c traceparent by turning off the default b3 multi:
+  b3multi: {{ .Values.TracingZipkin | quote }}
+  b3single: "false"
+---
+# Alias for fortio-client
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-a
+  namespace: fortio
+spec:
+  ports:
+  - port: 8080
+    name: {{ .Values.FortioProtocol }}-fortio
+  selector:
+    app: fortio-client
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortio-http-proxy-parallel
+  namespace: fortio
+spec:
+  replicas: 1 # tells deployment to run 1 pods matching the template
+  selector:
+    matchLabels:
+      app: fortio-http-proxy-parallel
+  template: # create pods using pod definition in this template
+    metadata:
+      # a unique name is generated from the deployment name
+      labels:
+        app: fortio-http-proxy-parallel
+    spec:
+      containers:
+      - name: fortio-http-proxy-parallel
+        image: fortio/fortio:{{ .Chart.Version }}
+        imagePullPolicy: IfNotPresent
+        securityContext: {{- toYaml .Values.commonSecurityContext | nindent 10 }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        ports:
+        - containerPort: 8088 # 'http' proxy to C1
+        args:
+          - proxies
+          - -M
+          - 8088 http://fortio-c1-http:8080 http://fortio-c2-http:8080 # fan out 2x
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortio-http-proxy-serial
+  namespace: fortio
+spec:
+  replicas: 1 # tells deployment to run 1 pods matching the template
+  selector:
+    matchLabels:
+      app: fortio-http-proxy-serial
+  template: # create pods using pod definition in this template
+    metadata:
+      # a unique name is generated from the deployment name
+      labels:
+        app: fortio-http-proxy-serial
+    spec:
+      containers:
+      - name: fortio-http-proxy-serial
+        image: fortio/fortio:{{ .Chart.Version }}
+        imagePullPolicy: IfNotPresent
+        securityContext: {{- toYaml .Values.commonSecurityContext | nindent 10 }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        ports:
+        - containerPort: 8088 # 'http' proxy to C1
+        args:
+          - proxies
+          - -multi-serial-mode
+          - -M
+          - 8088 http://fortio-c1-http:8080 http://fortio-c2-http:8080 # fan out 2x
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortio-tcp-proxy
+  namespace: fortio
+spec:
+  replicas: 1 # tells deployment to run 1 pods matching the template
+  selector:
+    matchLabels:
+      app: fortio-tcp-proxy
+  template: # create pods using pod definition in this template
+    metadata:
+      # a unique name is generated from the deployment name
+      labels:
+        app: fortio-tcp-proxy
+      annotations:
+        prometheus.io/path: /debug/metrics
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+      - name: fortio-tcp-proxy
+        image: fortio/fortio:{{ .Chart.Version }}
+        imagePullPolicy: IfNotPresent
+        securityContext: {{- toYaml .Values.commonSecurityContext | nindent 10 }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        ports:
+        - containerPort: 8089 # tcp proxy to C2
+        - containerPort: 8090 # tcp proxy to http C2 (to test payload and tcp metrics as tcp instead of pure echo)
+        args:
+          - server
+          - -P
+          - 8089 fortio-c-tcp:8078
+          - -P
+          - 8090 fortio-c1-http:8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-b-http-parallel
+  namespace: fortio
+spec:
+  ports:
+  - port: 8088
+    name: {{ .Values.FortioProtocol }}-proxy
+  selector:
+    app: fortio-http-proxy-parallel
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-b-http-serial
+  namespace: fortio
+spec:
+  ports:
+  - port: 8088
+    name: {{ .Values.FortioProtocol }}-proxy
+  selector:
+    app: fortio-http-proxy-serial
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-b-tcp
+  namespace: fortio
+spec:
+  ports:
+  - port: 8089
+    name: tcp-proxy
+  - port: 8090
+    name: tcp-proxy-to-http
+  selector:
+    app: fortio-tcp-proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-c1-http
+  namespace: fortio
+spec:
+  ports:
+  - port: 8080
+    name: {{ .Values.FortioProtocol }}-echo
+  selector:
+    app: fortio-server-1
+---
+# Same deployment/svc under 2 names so the proxy fan out makes a nice graph
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-c2-http
+  namespace: fortio
+spec:
+  ports:
+  - port: 8080
+    name: {{ .Values.FortioProtocol }}-echo
+  selector:
+    app: fortio-server-2-primary
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fortio-c-tcp
+  namespace: fortio
+spec:
+  ports:
+  - port: 8078
+    name: tcp-echo
+  selector:
+    app: fortio-server-1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortio-server-deployment-1
+  namespace: fortio
+spec:
+  replicas: 2 # tells deployment to run 2 pods matching the template
+  selector:
+    matchLabels:
+      app: fortio-server-1
+  template: # create pods using pod definition in this template
+    metadata:
+      # a unique name is generated from the deployment name
+      labels:
+        app: fortio-server-1
+    spec:
+      containers:
+      - name: fortio-server
+        image: fortio/fortio:{{ .Chart.Version }}
+        imagePullPolicy: IfNotPresent
+        args:
+          - server
+          - -ui-path
+          - "" # no load test or proxy endpoint, thus no metrics either
+          - -loglevel
+          - verbose
+        securityContext: {{- toYaml .Values.commonSecurityContext | nindent 10 }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        ports:
+        - containerPort: 8078 # tcp echo
+        - containerPort: 8079 # grpc echo
+        - containerPort: 8080 # http echo/debug
+---
+# This one has the "ui" (and thus the metrics as well)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortio-server-deployment-2
+  namespace: fortio
+spec:
+  selector:
+    matchLabels:
+      app: fortio-server-2
+  template: # create pods using pod definition in this template
+    metadata:
+      # a unique name is generated from the deployment name
+      labels:
+        app: fortio-server-2
+      annotations:
+        prometheus.io/path: /debug/metrics
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+      - name: fortio-server-2
+        image: fortio/fortio:{{ .Chart.Version }}
+        imagePullPolicy: IfNotPresent
+        securityContext: {{- toYaml .Values.commonSecurityContext | nindent 10 }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        ports:
+          - containerPort: 8078 # tcp echo
+          - containerPort: 8079 # grpc echo
+          - containerPort: 8080 # http echo/debug
+# hpa and canary are being added for fortio-server-2 for the purpose of adding
+# the flagger test
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fortio-server-deployment-2
+  namespace: fortio
+spec:
+  maxReplicas: 4
+  metrics:
+  - resource:
+      name: cpu
+      target:
+        averageUtilization: 99
+        type: Utilization
+    type: Resource
+  minReplicas: 2
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fortio-server-deployment-2
+---
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: fortio-server-deployment-2
+  namespace: fortio
+spec:
+  analysis:
+    interval: 30s
+    maxWeight: 50
+    metrics:
+    - interval: 30s
+      name: request-success-rate
+      thresholdRange:
+        min: 99
+    stepWeight: 10
+    threshold: 10
+    webhooks:
+    - metadata:
+        async: "on"
+        c: "6"
+        labels: fortio-server-deployment-2
+        load: Start
+        nocatchup: "on"
+        qps: "12"
+        save: "on"
+        stdclient: "on"
+        t: 600s
+        uniform: "on"
+        url: http://fortio-server-deployment-2-canary.fortio.svc.cluster.local:8080
+      name: generateLoad
+      timeout: 60s
+      type: pre-rollout
+      url: http://fortio-client.fortio.svc.cluster.local:8080/fortio/rest/run?jsonPath=.metadata
+  progressDeadlineSeconds: 600
+  autoscalerRef:
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    name: fortio-server-deployment-2
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fortio-server-deployment-2
+  service:
+    port: 8080
+    targetPort: 8080
